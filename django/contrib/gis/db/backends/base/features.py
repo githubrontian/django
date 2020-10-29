@@ -46,6 +46,9 @@ class BaseSpatialFeatures:
     # Does the database support a unique index on geometry fields?
     supports_geometry_field_unique_index = True
 
+    # Can SchemaEditor alter geometry fields?
+    can_alter_geometry_field = True
+
     @property
     def supports_bbcontains_lookup(self):
         return 'bbcontains' in self.connection.ops.gis_operators
@@ -94,6 +97,6 @@ class BaseSpatialFeatures:
     def __getattr__(self, name):
         m = re.match(r'has_(\w*)_function$', name)
         if m:
-            func_name = m.group(1)
+            func_name = m[1]
             return func_name not in self.connection.ops.unsupported_functions
         raise AttributeError

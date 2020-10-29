@@ -25,7 +25,7 @@ class SetLanguageTests(TestCase):
     def _get_inactive_language_code(self):
         """Return language code for a language which is not activated."""
         current_language = get_language()
-        return [code for code, name in settings.LANGUAGES if not code == current_language][0]
+        return [code for code, name in settings.LANGUAGES if code != current_language][0]
 
     def test_setlang(self):
         """
@@ -249,10 +249,10 @@ class I18NViewTests(SimpleTestCase):
                 catalog = gettext.translation('djangojs', locale_dir, [lang_code])
                 trans_txt = catalog.gettext('this is to be translated')
                 response = self.client.get('/jsi18n/')
-                self.assertEqual(response['Content-Type'], 'text/javascript; charset="utf-8"')
+                self.assertEqual(response.headers['Content-Type'], 'text/javascript; charset="utf-8"')
                 # response content must include a line like:
                 # "this is to be translated": <value of trans_txt Python variable>
-                # json.dumps() is used to be able to check unicode strings
+                # json.dumps() is used to be able to check Unicode strings.
                 self.assertContains(response, json.dumps(trans_txt), 1)
                 if lang_code == 'fr':
                     # Message with context (msgctxt)

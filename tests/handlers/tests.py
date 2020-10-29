@@ -50,7 +50,7 @@ class HandlerTests(SimpleTestCase):
             environ['QUERY_STRING'] = str(raw_query_string, 'iso-8859-1')
             request = WSGIRequest(environ)
             got.append(request.GET['want'])
-        # %E9 is converted to the unicode replacement character by parse_qsl
+        # %E9 is converted to the Unicode replacement character by parse_qsl
         self.assertEqual(got, ['café', 'café', 'caf\ufffd', 'café'])
 
     def test_non_ascii_cookie(self):
@@ -176,6 +176,10 @@ class HandlerRequestTests(SimpleTestCase):
         response = self.client.get('/suspicious/')
         self.assertEqual(response.status_code, 400)
 
+    def test_bad_request_in_view_returns_400(self):
+        response = self.client.get('/bad_request/')
+        self.assertEqual(response.status_code, 400)
+
     def test_invalid_urls(self):
         response = self.client.get('~%A9helloworld')
         self.assertEqual(response.status_code, 404)
@@ -257,6 +261,10 @@ class AsyncHandlerRequestTests(SimpleTestCase):
 
     async def test_suspiciousop_in_view_returns_400(self):
         response = await self.async_client.get('/suspicious/')
+        self.assertEqual(response.status_code, 400)
+
+    async def test_bad_request_in_view_returns_400(self):
+        response = await self.async_client.get('/bad_request/')
         self.assertEqual(response.status_code, 400)
 
     async def test_no_response(self):

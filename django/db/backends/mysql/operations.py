@@ -3,7 +3,6 @@ import uuid
 from django.conf import settings
 from django.db.backends.base.operations import BaseDatabaseOperations
 from django.utils import timezone
-from django.utils.duration import duration_microseconds
 from django.utils.encoding import force_str
 
 
@@ -30,6 +29,7 @@ class DatabaseOperations(BaseDatabaseOperations):
         'PositiveBigIntegerField': 'unsigned integer',
         'PositiveIntegerField': 'unsigned integer',
         'PositiveSmallIntegerField': 'unsigned integer',
+        'DurationField': 'signed integer',
     }
     cast_char_field_without_max_length = 'char'
     explain_prefix = 'EXPLAIN'
@@ -55,7 +55,8 @@ class DatabaseOperations(BaseDatabaseOperations):
             # EXTRACT returns 1-53 based on ISO-8601 for the week number.
             return "EXTRACT(%s FROM %s)" % (lookup_type.upper(), field_name)
 
-    def date_trunc_sql(self, lookup_type, field_name):
+    def date_trunc_sql(self, lookup_type, field_name, tzname=None):
+        field_name = self._convert_field_to_tz(field_name, tzname)
         fields = {
             'year': '%%Y-01-01',
             'month': '%%Y-%%m-01',
@@ -82,7 +83,7 @@ class DatabaseOperations(BaseDatabaseOperations):
         return tzname
 
     def _convert_field_to_tz(self, field_name, tzname):
-        if settings.USE_TZ and self.connection.timezone_name != tzname:
+        if tzname and settings.USE_TZ and self.connection.timezone_name != tzname:
             field_name = "CONVERT_TZ(%s, '%s', '%s')" % (
                 field_name,
                 self.connection.timezone_name,
@@ -128,7 +129,8 @@ class DatabaseOperations(BaseDatabaseOperations):
             sql = "CAST(DATE_FORMAT(%s, '%s') AS DATETIME)" % (field_name, format_str)
         return sql
 
-    def time_trunc_sql(self, lookup_type, field_name):
+    def time_trunc_sql(self, lookup_type, field_name, tzname=None):
+        field_name = self._convert_field_to_tz(field_name, tzname)
         fields = {
             'hour': '%%H:00:00',
             'minute': '%%H:%%i:00',
@@ -139,9 +141,6 @@ class DatabaseOperations(BaseDatabaseOperations):
             return "CAST(DATE_FORMAT(%s, '%s') AS TIME)" % (field_name, format_str)
         else:
             return "TIME(%s)" % (field_name)
-
-    def date_interval_sql(self, timedelta):
-        return 'INTERVAL %s MICROSECOND' % duration_microseconds(timedelta)
 
     def fetch_returned_insert_rows(self, cursor):
         """
@@ -177,9 +176,6 @@ class DatabaseOperations(BaseDatabaseOperations):
             return name  # Quoting once is enough.
         return "`%s`" % name
 
-    def random_function_sql(self):
-        return 'RAND()'
-
     def return_insert_columns(self, fields):
         # MySQL and MariaDB < 10.5.0 don't support an INSERT...RETURNING
         # statement.
@@ -193,29 +189,30 @@ class DatabaseOperations(BaseDatabaseOperations):
         ]
         return 'RETURNING %s' % ', '.join(columns), ()
 
-    def sql_flush(self, style, tables, sequences, allow_cascade=False):
+    def sql_flush(self, style, tables, *, reset_sequences=False, allow_cascade=False):
         if not tables:
             return []
+
         sql = ['SET FOREIGN_KEY_CHECKS = 0;']
-        tables = set(tables)
-        with_sequences = set(s['table'] for s in sequences)
-        # It's faster to TRUNCATE tables that require a sequence reset since
-        # ALTER TABLE AUTO_INCREMENT is slower than TRUNCATE.
-        sql.extend(
-            '%s %s;' % (
-                style.SQL_KEYWORD('TRUNCATE'),
-                style.SQL_FIELD(self.quote_name(table_name)),
-            ) for table_name in tables.intersection(with_sequences)
-        )
-        # Otherwise issue a simple DELETE since it's faster than TRUNCATE
-        # and preserves sequences.
-        sql.extend(
-            '%s %s %s;' % (
-                style.SQL_KEYWORD('DELETE'),
-                style.SQL_KEYWORD('FROM'),
-                style.SQL_FIELD(self.quote_name(table_name)),
-            ) for table_name in tables.difference(with_sequences)
-        )
+        if reset_sequences:
+            # It's faster to TRUNCATE tables that require a sequence reset
+            # since ALTER TABLE AUTO_INCREMENT is slower than TRUNCATE.
+            sql.extend(
+                '%s %s;' % (
+                    style.SQL_KEYWORD('TRUNCATE'),
+                    style.SQL_FIELD(self.quote_name(table_name)),
+                ) for table_name in tables
+            )
+        else:
+            # Otherwise issue a simple DELETE since it's faster than TRUNCATE
+            # and preserves sequences.
+            sql.extend(
+                '%s %s %s;' % (
+                    style.SQL_KEYWORD('DELETE'),
+                    style.SQL_KEYWORD('FROM'),
+                    style.SQL_FIELD(self.quote_name(table_name)),
+                ) for table_name in tables
+            )
         sql.append('SET FOREIGN_KEY_CHECKS = 1;')
         return sql
 
@@ -230,8 +227,9 @@ class DatabaseOperations(BaseDatabaseOperations):
         ]
 
     def validate_autopk_value(self, value):
-        # MySQLism: zero in AUTO_INCREMENT field does not work. Refs #17653.
-        if value == 0:
+        # Zero in AUTO_INCREMENT field does not work without the
+        # NO_AUTO_VALUE_ON_ZERO SQL mode.
+        if value == 0 and not self.connection.features.allows_auto_pk_0:
             raise ValueError('The database backend does not accept 0 as a '
                              'value for AutoField.')
         return value
@@ -268,6 +266,9 @@ class DatabaseOperations(BaseDatabaseOperations):
 
     def max_name_length(self):
         return 64
+
+    def pk_default_value(self):
+        return 'NULL'
 
     def bulk_insert_sql(self, fields, placeholder_rows):
         placeholder_rows_sql = (", ".join(row) for row in placeholder_rows)
@@ -349,14 +350,11 @@ class DatabaseOperations(BaseDatabaseOperations):
         if format and not (analyze and not self.connection.mysql_is_mariadb):
             # Only MariaDB supports the analyze option with formats.
             prefix += ' FORMAT=%s' % format
-        if self.connection.features.needs_explain_extended and not analyze and format is None:
-            # ANALYZE, EXTENDED, and FORMAT are mutually exclusive options.
-            prefix += ' EXTENDED'
         return prefix
 
     def regex_lookup(self, lookup_type):
         # REGEXP BINARY doesn't work correctly in MySQL 8+ and REGEXP_LIKE
-        # doesn't exist in MySQL 5.6 or in MariaDB.
+        # doesn't exist in MySQL 5.x or in MariaDB.
         if self.connection.mysql_version < (8, 0, 0) or self.connection.mysql_is_mariadb:
             if lookup_type == 'regex':
                 return '%s REGEXP BINARY %s'
@@ -367,3 +365,13 @@ class DatabaseOperations(BaseDatabaseOperations):
 
     def insert_statement(self, ignore_conflicts=False):
         return 'INSERT IGNORE INTO' if ignore_conflicts else super().insert_statement(ignore_conflicts)
+
+    def lookup_cast(self, lookup_type, internal_type=None):
+        lookup = '%s'
+        if internal_type == 'JSONField':
+            if self.connection.mysql_is_mariadb or lookup_type in (
+                'iexact', 'contains', 'icontains', 'startswith', 'istartswith',
+                'endswith', 'iendswith', 'regex', 'iregex',
+            ):
+                lookup = 'JSON_UNQUOTE(%s)'
+        return lookup

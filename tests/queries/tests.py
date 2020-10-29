@@ -3,6 +3,7 @@ import pickle
 import sys
 import unittest
 from operator import attrgetter
+from threading import Lock
 
 from django.core.exceptions import EmptyResultSet, FieldError
 from django.db import DEFAULT_DB_ALIAS, connection
@@ -46,7 +47,7 @@ class Queries1Tests(TestCase):
 
         cls.n1 = Note.objects.create(note='n1', misc='foo', id=1)
         cls.n2 = Note.objects.create(note='n2', misc='bar', id=2)
-        cls.n3 = Note.objects.create(note='n3', misc='foo', id=3)
+        cls.n3 = Note.objects.create(note='n3', misc='foo', id=3, negate=False)
 
         ann1 = Annotation.objects.create(name='a1', tag=cls.t1)
         ann1.notes.add(cls.n1)
@@ -55,12 +56,12 @@ class Queries1Tests(TestCase):
 
         # Create these out of order so that sorting by 'id' will be different to sorting
         # by 'info'. Helps detect some problems later.
-        cls.e2 = ExtraInfo.objects.create(info='e2', note=cls.n2, value=41)
+        cls.e2 = ExtraInfo.objects.create(info='e2', note=cls.n2, value=41, filterable=False)
         e1 = ExtraInfo.objects.create(info='e1', note=cls.n1, value=42)
 
         cls.a1 = Author.objects.create(name='a1', num=1001, extra=e1)
         cls.a2 = Author.objects.create(name='a2', num=2002, extra=e1)
-        a3 = Author.objects.create(name='a3', num=3003, extra=cls.e2)
+        cls.a3 = Author.objects.create(name='a3', num=3003, extra=cls.e2)
         cls.a4 = Author.objects.create(name='a4', num=4004, extra=cls.e2)
 
         cls.time1 = datetime.datetime(2007, 12, 19, 22, 25, 0)
@@ -76,7 +77,7 @@ class Queries1Tests(TestCase):
         i4.tags.set([t4])
 
         cls.r1 = Report.objects.create(name='r1', creator=cls.a1)
-        Report.objects.create(name='r2', creator=a3)
+        Report.objects.create(name='r2', creator=cls.a3)
         Report.objects.create(name='r3')
 
         # Ordering by 'rank' gives us rank2, rank1, rank3. Ordering by the Meta.ordering
@@ -848,14 +849,6 @@ class Queries1Tests(TestCase):
         self.assertQuerysetEqual(Note.objects.none() & Note.objects.all(), [])
         self.assertQuerysetEqual(Note.objects.all() & Note.objects.none(), [])
 
-    def test_ticket9411(self):
-        # Make sure bump_prefix() (an internal Query method) doesn't (re-)break. It's
-        # sufficient that this query runs without error.
-        qs = Tag.objects.values_list('id', flat=True).order_by('id')
-        qs.query.bump_prefix(qs.query)
-        first = qs[0]
-        self.assertEqual(list(qs), list(range(first, first + 5)))
-
     def test_ticket8439(self):
         # Complex combinations of conjunctions, disjunctions and nullable
         # relations.
@@ -1208,6 +1201,19 @@ class Queries1Tests(TestCase):
             Note.objects.filter(tag__annotation__name='a1').filter(~Q(tag__annotation__name=F('note'))),
             [],
         )
+
+    def test_field_with_filterable(self):
+        self.assertSequenceEqual(
+            Author.objects.filter(extra=self.e2),
+            [self.a3, self.a4],
+        )
+
+    def test_negate_field(self):
+        self.assertSequenceEqual(
+            Note.objects.filter(negate=True),
+            [self.n1, self.n2],
+        )
+        self.assertSequenceEqual(Note.objects.exclude(negate=True), [self.n3])
 
 
 class Queries2Tests(TestCase):
@@ -1961,7 +1967,8 @@ class Queries6Tests(TestCase):
 
 
 class RawQueriesTests(TestCase):
-    def setUp(self):
+    @classmethod
+    def setUpTestData(cls):
         Note.objects.create(note='n1', misc='foo', id=1)
 
     def test_ticket14729(self):
@@ -1985,10 +1992,11 @@ class GeneratorExpressionTests(SimpleTestCase):
 
 
 class ComparisonTests(TestCase):
-    def setUp(self):
-        self.n1 = Note.objects.create(note='n1', misc='foo', id=1)
-        e1 = ExtraInfo.objects.create(info='e1', note=self.n1)
-        self.a2 = Author.objects.create(name='a2', num=2002, extra=e1)
+    @classmethod
+    def setUpTestData(cls):
+        cls.n1 = Note.objects.create(note='n1', misc='foo', id=1)
+        e1 = ExtraInfo.objects.create(info='e1', note=cls.n1)
+        cls.a2 = Author.objects.create(name='a2', num=2002, extra=e1)
 
     def test_ticket8597(self):
         # Regression tests for case-insensitive comparisons
@@ -2067,6 +2075,16 @@ class QuerysetOrderedTests(unittest.TestCase):
         qs = Annotation.objects.annotate(num_notes=Count('notes'))
         self.assertIs(qs.ordered, False)
         self.assertIs(qs.order_by('num_notes').ordered, True)
+
+    def test_annotated_default_ordering(self):
+        qs = Tag.objects.annotate(num_notes=Count('pk'))
+        self.assertIs(qs.ordered, False)
+        self.assertIs(qs.order_by('name').ordered, True)
+
+    def test_annotated_values_default_ordering(self):
+        qs = Tag.objects.values('name').annotate(num_notes=Count('pk'))
+        self.assertIs(qs.ordered, False)
+        self.assertIs(qs.order_by('name').ordered, True)
 
 
 @skipUnlessDBFeature('allow_sliced_subqueries_with_in')
@@ -2198,6 +2216,10 @@ class CloneTests(TestCase):
         n_list = Note.objects.all()
         # Evaluate the Note queryset, populating the query cache
         list(n_list)
+        # Make one of cached results unpickable.
+        n_list._result_cache[0].lock = Lock()
+        with self.assertRaises(TypeError):
+            pickle.dumps(n_list)
         # Use the note queryset in a query, and evaluate
         # that query in a way that involves cloning.
         self.assertEqual(ExtraInfo.objects.filter(note__in=n_list)[0].info, 'good')
@@ -2359,7 +2381,10 @@ class ValuesQuerysetTests(TestCase):
         qs = Number.objects.extra(select={'num2': 'num+1'}).annotate(Count('id'))
         values = qs.values_list(named=True).first()
         self.assertEqual(type(values).__name__, 'Row')
-        self.assertEqual(values._fields, ('num2', 'id', 'num', 'other_num', 'id__count'))
+        self.assertEqual(
+            values._fields,
+            ('num2', 'id', 'num', 'other_num', 'another_num', 'id__count'),
+        )
         self.assertEqual(values.num, 72)
         self.assertEqual(values.num2, 73)
         self.assertEqual(values.id__count, 1)
@@ -2374,6 +2399,11 @@ class ValuesQuerysetTests(TestCase):
         qs = Number.objects.annotate(combinedexpression1=expr).values_list(expr, 'combinedexpression1', named=True)
         values = qs.first()
         self.assertEqual(values._fields, ('combinedexpression2', 'combinedexpression1'))
+
+    def test_named_values_pickle(self):
+        value = Number.objects.values_list('num', 'other_num', named=True).get()
+        self.assertEqual(value, (72, None))
+        self.assertEqual(pickle.loads(pickle.dumps(value)), value)
 
 
 class QuerySetSupportsPythonIdioms(TestCase):
@@ -2777,11 +2807,11 @@ class ExcludeTests(TestCase):
         f1 = Food.objects.create(name='apples')
         Food.objects.create(name='oranges')
         Eaten.objects.create(food=f1, meal='dinner')
-        j1 = Job.objects.create(name='Manager')
+        cls.j1 = Job.objects.create(name='Manager')
         cls.r1 = Responsibility.objects.create(description='Playing golf')
         j2 = Job.objects.create(name='Programmer')
         r2 = Responsibility.objects.create(description='Programming')
-        JobResponsibilities.objects.create(job=j1, responsibility=cls.r1)
+        JobResponsibilities.objects.create(job=cls.j1, responsibility=cls.r1)
         JobResponsibilities.objects.create(job=j2, responsibility=r2)
 
     def test_to_field(self):
@@ -2841,6 +2871,26 @@ class ExcludeTests(TestCase):
         self.assertTrue(qs.exists())
         self.r1.delete()
         self.assertFalse(qs.exists())
+
+    def test_exclude_nullable_fields(self):
+        number = Number.objects.create(num=1, other_num=1)
+        Number.objects.create(num=2, other_num=2, another_num=2)
+        self.assertSequenceEqual(
+            Number.objects.exclude(other_num=F('another_num')),
+            [number],
+        )
+        self.assertSequenceEqual(
+            Number.objects.exclude(num=F('another_num')),
+            [number],
+        )
+
+    def test_exclude_multivalued_exists(self):
+        with CaptureQueriesContext(connection) as captured_queries:
+            self.assertSequenceEqual(
+                Job.objects.exclude(responsibilities__description='Programming'),
+                [self.j1],
+            )
+        self.assertIn('exists', captured_queries[0]['sql'].lower())
 
 
 class ExcludeTest17600(TestCase):

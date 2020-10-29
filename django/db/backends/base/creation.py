@@ -58,7 +58,14 @@ class BaseDatabaseCreation:
         settings.DATABASES[self.connection.alias]["NAME"] = test_database_name
         self.connection.settings_dict["NAME"] = test_database_name
 
-        if self.connection.settings_dict['TEST']['MIGRATE']:
+        try:
+            if self.connection.settings_dict['TEST']['MIGRATE'] is False:
+                # Disable migrations for all apps.
+                old_migration_modules = settings.MIGRATION_MODULES
+                settings.MIGRATION_MODULES = {
+                    app.label: None
+                    for app in apps.get_app_configs()
+                }
             # We report migrate messages at one level lower than that
             # requested. This ensures we don't get flooded with messages during
             # testing (unless you really ask to be flooded).
@@ -69,6 +76,9 @@ class BaseDatabaseCreation:
                 database=self.connection.alias,
                 run_syncdb=True,
             )
+        finally:
+            if self.connection.settings_dict['TEST']['MIGRATE'] is False:
+                settings.MIGRATION_MODULES = old_migration_modules
 
         # We then serialize the current state of the database into a string
         # and store it on the connection. This slightly horrific process is so people
@@ -127,6 +137,7 @@ class BaseDatabaseCreation:
         the serialize_db_to_string() method.
         """
         data = StringIO(data)
+        table_names = set()
         # Load data in a transaction to handle forward references and cycles.
         with atomic(using=self.connection.alias):
             # Disable constraint checks, because some databases (MySQL) doesn't
@@ -134,9 +145,10 @@ class BaseDatabaseCreation:
             with self.connection.constraint_checks_disabled():
                 for obj in serializers.deserialize('json', data, using=self.connection.alias):
                     obj.save()
+                    table_names.add(obj.object.__class__._meta.db_table)
             # Manually check for any invalid keys that might have been added,
             # because constraint checks were disabled.
-            self.connection.check_constraints()
+            self.connection.check_constraints(table_names=table_names)
 
     def _get_database_display_str(self, verbosity, database_name):
         """
