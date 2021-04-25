@@ -540,11 +540,17 @@ class AsyncRequestFactory(RequestFactory):
         }
         if data:
             s['headers'].extend([
-                (b'content-length', bytes(len(data))),
+                (b'content-length', str(len(data)).encode('ascii')),
                 (b'content-type', content_type.encode('ascii')),
             ])
             s['_body_file'] = FakePayload(data)
-        s.update(extra)
+        follow = extra.pop('follow', None)
+        if follow is not None:
+            s['follow'] = follow
+        s['headers'] += [
+            (key.lower().encode('ascii'), value.encode('latin1'))
+            for key, value in extra.items()
+        ]
         # If QUERY_STRING is absent or empty, we want to extract it from the
         # URL.
         if not s.get('query_string'):
@@ -719,7 +725,10 @@ class Client(ClientMixin, RequestFactory):
         response.context = data.get('context')
         response.json = partial(self._parse_json, response)
         # Attach the ResolverMatch instance to the response.
-        response.resolver_match = SimpleLazyObject(lambda: resolve(request['PATH_INFO']))
+        urlconf = getattr(response.wsgi_request, 'urlconf', None)
+        response.resolver_match = SimpleLazyObject(
+            lambda: resolve(request['PATH_INFO'], urlconf=urlconf),
+        )
         # Flatten a single context. Not really necessary anymore thanks to the
         # __getattr__ flattening in ContextList, but has some edge case
         # backwards compatibility implications.
@@ -908,7 +917,10 @@ class AsyncClient(ClientMixin, AsyncRequestFactory):
         response.context = data.get('context')
         response.json = partial(self._parse_json, response)
         # Attach the ResolverMatch instance to the response.
-        response.resolver_match = SimpleLazyObject(lambda: resolve(request['path']))
+        urlconf = getattr(response.asgi_request, 'urlconf', None)
+        response.resolver_match = SimpleLazyObject(
+            lambda: resolve(request['path'], urlconf=urlconf),
+        )
         # Flatten a single context. Not really necessary anymore thanks to the
         # __getattr__ flattening in ContextList, but has some edge case
         # backwards compatibility implications.
